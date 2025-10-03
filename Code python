@@ -1,0 +1,151 @@
+# pip install yfinance pandas numpy matplotlib
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# =============== Paramètres ===============
+START, END = "2018-01-01", "2025-01-01"
+FREQ = "M"          
+WIN  = 3            # rééquilibrage mensuel mais basé sur la perf des 3 derniers mois
+ANN  = 12
+TOP_K = 10          # TOP 10 actions du CAC40
+BENCH = "^FCHI"     # CAC 40 
+
+# Indice target vol : Si il y a trop de vol, On ajoute du cash qui rapporte 2% par an 
+CASH_YIELD_ANNUAL = 0.02
+CASH_YIELD_PERIOD = (1 + CASH_YIELD_ANNUAL)**(1/ANN) - 1
+
+# =============== CAC 40 Universe de Yahoo Finance  ===============
+UNIVERSE = [
+    # Luxe / conso discrétionnaire
+    "MC.PA","RMS.PA","KER.PA","CDI.PA", 
+    # Conso de base / beauté / boissons
+    "OR.PA","BN.PA","RI.PA","EL.PA",
+    # Communication / médias / télécom
+    "ORA.PA","VIV.PA","PUB.PA",
+    # Industriels / aéro / construction
+    "AIR.PA","SU.PA","DG.PA","HO.PA","ALO.PA",
+    # Tech / IT / semi
+    "CAP.PA","STMPA.PA",
+    # Matériaux
+    "AI.PA","SGO.PA",
+    # Santé
+    "SAN.PA",
+    # Énergie / utilités
+    "TTE.PA","ENGI.PA","VIE.PA",
+    # Financières
+    "BNP.PA","ACA.PA","GLE.PA","CS.PA"  # AXA = CS.PA
+]
+
+SECTOR_MAP = {
+    "MC.PA":"ConsDisc","RMS.PA":"ConsDisc","KER.PA":"ConsDisc","CDI.PA":"ConsDisc",
+    "OR.PA":"ConsStap","BN.PA":"ConsStap","RI.PA":"ConsStap","EL.PA":"ConsStap",
+    "ORA.PA":"Comm","VIV.PA":"Comm","PUB.PA":"Comm",
+    "AIR.PA":"Industrials","SU.PA":"Industrials","DG.PA":"Industrials","HO.PA":"Industrials","ALO.PA":"Industrials",
+    "CAP.PA":"Tech","STMPA.PA":"Tech","STM.PA":"Tech",
+    "AI.PA":"Materials","SGO.PA":"Materials",
+    "SAN.PA":"Health",
+    "TTE.PA":"Energy","ENGI.PA":"Utilities","VIE.PA":"Utilities",
+    "BNP.PA":"Financials","ACA.PA":"Financials","GLE.PA":"Financials","CS.PA":"Financials"
+}
+
+# =============== Téléchargement ===============
+tickers = sorted(set(UNIVERSE)) + [BENCH] #ça retire les doublons puis ordre alphabetique
+raw = yf.download(tickers, start=START, end=END, auto_adjust=False, progress=False)
+
+px_daily = (raw["Adj Close"] if "Adj Close" in raw.columns else raw["Close"]) \
+           .reindex(columns=tickers).ffill().bfill()
+
+# Passage en fin de mois
+px   = px_daily.resample(FREQ).last()
+returns = px.pct_change()
+
+# =============== Score = Momentum 3mois-1mois / Vol (3 mois) ===============
+mom = (px.shift(1) / px.shift(WIN+1) - 1.0)   # momentum 3-1
+vol = returns.rolling(WIN).std(ddof=0)
+score = mom.div(vol.replace(0, np.nan)) 
+
+# =============== Trend filter marché (cash management) ===============
+# SMA 10 mois sur le CAC40 : si prix < SMA10 → expo actions = 50%, sinon 100%
+bench_px  = px[BENCH]
+bench_sma = bench_px.rolling(10).mean()
+#Ça réduit fortement le Max Drawdown (parce qu’on coupe le risque quand le marché passe sous sa tendance long terme).
+
+def exposure_at(date):
+    if pd.isna(bench_sma.loc[date]): 
+        return 1.0
+    return 0.5 if bench_px.loc[date] < bench_sma.loc[date] else 1.0
+
+# =============== Backtest: Top 5 (max 1 par secteur) ===============
+dates = rets.index
+p_rets, log = [], []
+
+for i in range(WIN+1, len(dates)-1):
+    t_sig, t_hold = dates[i], dates[i+1]
+
+    s = score.loc[t_sig, avail].dropna()
+    if s.empty:
+        continue
+
+    df = pd.DataFrame({"ticker": s.index, "score": s.values})
+    df["sector"] = df["ticker"].map(sector_of)
+
+    # Meilleur titre par secteur → puis Top5 global
+    best_per_sector = df.loc[df.groupby("sector")["score"].idxmax()]
+    top = best_per_sector.sort_values("score", ascending=False).head(TOP_K)
+
+    sel = top["ticker"].tolist()
+    sector_ret = rets.loc[t_hold, sel].mean()
+
+    expo = exposure_at(t_sig)                # 1.0 ou 0.5 selon trend marché
+    cash_ret = CASH_YIELD_PERIOD            # cash rémunéré (2%/an ici)
+    next_ret = expo * sector_ret + (1.0 - expo) * cash_ret
+
+    p_rets.append((t_hold, float(next_ret)))
+    log.append({
+        "Date": t_hold.strftime("%Y-%m-%d"),
+        "Selected": ", ".join(sel),
+        "Sectors":  ", ".join(top["sector"].tolist()),
+        "Exposure": expo
+    })
+
+# Série & stats
+port = pd.Series([r for (_, r) in p_rets], index=[d for (d, _) in p_rets], name="Strategy")
+cum_port = (1 + port).cumprod()
+
+def max_drawdown(c): return ((c / c.cummax()) - 1.0).min()
+def annualized_stats(r, ann=ANN):
+    r = r.dropna()
+    if len(r) < 2 or r.std(ddof=0) == 0: return np.nan, np.nan, np.nan
+    cum = (1 + r).cumprod(); n = len(r)
+    ann_ret = cum.iloc[-1]**(ann/n) - 1
+    sharpe  = (r.mean()/r.std(ddof=0))*np.sqrt(ann)
+    mdd     = max_drawdown(cum)
+    return ann_ret, sharpe, mdd
+
+ann_ret, sharpe, mdd = annualized_stats(port, ANN)
+bench = rets[BENCH].loc[port.index]
+cum_b  = (1 + bench).cumprod()
+b_ann, b_sh, b_mdd = annualized_stats(bench, ANN)
+
+# =============== Résultats ===============
+print("\n=== COMPOSITION (head) ===")
+print(pd.DataFrame(log).head())
+
+print("\n=== STATS STRATÉGIE (Top5, 1/secteur, mom3-1/vol, trend cash) ===")
+print(f"Ann. Return : {ann_ret:.2%}")
+print(f"Sharpe      : {sharpe:.2f}")
+print(f"Max DD      : {mdd:.2%}")
+
+print("\n=== STATS BENCHMARK (CAC40) ===")
+print(f"Ann. Return : {b_ann:.2%}")
+print(f"Sharpe      : {b_sh:.2f}")
+print(f"Max DD      : {b_mdd:.2%}")
+
+# =============== Graphe ===============
+plt.figure(figsize=(10,6))
+cum_port.plot(label="Top 5 (mom3-1/vol, 1/secteur) + trend cash", lw=2)
+cum_b.plot(label="CAC40 (^FCHI)", lw=2, ls="--")
+plt.title(f"CAC40 Rotation — {START}→{END} | Mensuel | Cash mgmt via SMA10")
+plt.legend(); plt.tight_layout(); plt.show()
