@@ -1,0 +1,10 @@
+**Résultats backtest (2018–2025)**  
+- Stratégie (Top 5 CAC40, mom3-1/vol) :  
+  - Ann. Return : ~9%  
+  - Sharpe      : ~0.61  
+  - Max DD      : ~-20%  
+
+- Benchmark (CAC40) :  
+  - Ann. Return : ~5%  
+  - Sharpe      : ~0.36  
+  - Max DD      : ~-26%  
